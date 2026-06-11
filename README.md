@@ -31,4 +31,5 @@ The installer copies the recorder to `%LOCALAPPDATA%\TimesheetRecorder\bin` (out
 ```
 
 ### Example Output
+
 ![Example Output](assets/example-output.png)

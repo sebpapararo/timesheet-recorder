@@ -1,3 +1,4 @@
+[CmdletBinding()]
 param (
     [Parameter(Mandatory=$true)]
     [ValidateSet('Unlock','Lock','Heartbeat')]
