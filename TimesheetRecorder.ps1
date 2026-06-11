@@ -1,70 +1,64 @@
 param (
     [Parameter(Mandatory=$true)]
-    [string]$username
+    [ValidateSet('Unlock','Lock','Heartbeat')]
+    [string]$Action,
+
+    [string]$OutputDirectory = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Timesheet Recorder')
 )
 
-$outputDirectory = "C:\Users\$username\Documents\Timesheet Recorder"
+# The lock flag gates the heartbeat so locked time is not counted as worked time
+$stateDirectory = Join-Path $env:LOCALAPPDATA 'TimesheetRecorder'
+$lockFlagPath = Join-Path $stateDirectory 'session.locked'
+if (-not (Test-Path -Path $stateDirectory -PathType Container)) {
+    New-Item -ItemType Directory -Path $stateDirectory | Out-Null
+}
+
+switch ($Action) {
+    'Lock'      { New-Item -ItemType File -Path $lockFlagPath -Force | Out-Null }
+    'Unlock'    { if (Test-Path -Path $lockFlagPath) { Remove-Item -Path $lockFlagPath -Force } }
+    'Heartbeat' { if (Test-Path -Path $lockFlagPath) { return } }
+}
+
 $now = Get-Date
 $currentDay   = $now.ToString('dd')
 $currentMonth = $now.ToString('MMMM')
 $currentYear  = $now.ToString('yyyy')
-$outputFileName = "$currentMonth $currentYear.txt"
-$fullOutputPath = "$outputDirectory\$outputFileName"
-$startOfDay = ($now).Date
-$endOfDay = $startOfDay.AddDays(1)
+$fullOutputPath = Join-Path $OutputDirectory "$currentMonth $currentYear.txt"
 
-# Build queries for logon, logoff, and shutdown events
-$queries = @{
-    Logon = @{ Filter = @{ LogName='Security'; ID=4624; StartTime=$startOfDay; EndTime=$endOfDay }; ErrorAction = 'Stop' }
-    Logoff = @{ Filter = @{ LogName='Security'; ID=4634; StartTime=$startOfDay; EndTime=$endOfDay }; ErrorAction = 'SilentlyContinue' }
-    Shutdown = @{ Filter = @{ LogName='System'; ID=42,1074,6008; StartTime=$startOfDay; EndTime=$endOfDay }; ErrorAction = 'SilentlyContinue' }
+if (-not (Test-Path -Path $OutputDirectory -PathType Container)) {
+    New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
+}
+if (-not (Test-Path -Path $fullOutputPath -PathType Leaf)) {
+    New-Item -ItemType File -Path $fullOutputPath | Out-Null
 }
 
-$results = @{}
-# Process each query in parallel (requires PowerShell 7+)
-$queries.GetEnumerator() | ForEach-Object -Parallel {
-    $name = $_.Key
-    $q = $_.Value
-    $events = Get-WinEvent -FilterHashtable $q.Filter -ErrorAction $q.ErrorAction
-    [PSCustomObject]@{ Name = $name; Events = $events }
-} -ThrottleLimit 3 | ForEach-Object {
-    $results[$_.Name] = $_.Events
+# Today's start time is recovered from the existing line, keeping the script stateless
+$currentContents = @(Get-Content -Path $fullOutputPath)
+$existingLine = $currentContents |
+    Select-String -Pattern "^$currentDay ${currentMonth}: (\d{2}:\d{2}:\d{2})" |
+    Select-Object -First 1
+
+if ($existingLine) {
+    # A corrupted/hand-edited start time (e.g. 25:99:99) must not crash every later stamp;
+    # fall back to treating now as the start and rewriting the line.
+    try {
+        $startTimeOfDay = [DateTime]::ParseExact($existingLine.Matches[0].Groups[1].Value, 'HH:mm:ss', [CultureInfo]::InvariantCulture).TimeOfDay
+        $start = $now.Date.Add($startTimeOfDay)
+    }
+    catch {
+        $start = $now
+    }
+}
+else {
+    $start = $now
 }
 
-# Access results
-$logonEvents    = $results['Logon']
-$logoffEvents   = $results['Logoff']
-$shutdownEvents   = $results['Shutdown']
+$duration = New-TimeSpan -Start $start -End $now
+$newLine = "$currentDay ${currentMonth}: $($start.ToString('HH:mm:ss')) -> $($now.ToString('HH:mm:ss'))  ($($duration.Hours) hours $($duration.Minutes) minutes)"
 
-# Create the output directory if it does not exist
-if (-Not (Test-Path -Path $outputDirectory -PathType Container)) {
-    New-Item -ItemType Directory -Path $outputDirectory
-}
-
-# Create the output file if it does not exist
-if (-Not (Test-Path -Path $fullOutputPath -PathType Leaf)) {
-    New-Item -ItemType File -Path $fullOutputPath
-}
-
-
-# Get the first logon and last logoff and calculate duration
-$firstLogon = ($logonEvents | Sort-Object TimeCreated -Top 1).TimeCreated
-$firstLogonTime = $firstLogon.ToString("HH:mm:ss")
-$lastLogoffOrShutdown = (@($logoffEvents) + @($shutdownEvents) | Sort-Object TimeCreated -Descending -Top 1).TimeCreated
-$lastLogoffTime = $lastLogoffOrShutdown.ToString("HH:mm:ss")
-
-$duration = New-TimeSpan -Start $firstLogon -End $lastLogoffOrShutdown
-
-# Construct line to be written
-$newLine = "$currentDay $currentMonth`: $firstLogonTime -> $lastLogoffTime  ($($duration.Hours) hours $($duration.Minutes) minutes)"
-
-# Get the current file contents and check if there is already an entry for today's date
-$currentContents = @(Get-Content "$fullOutputPath")
-$existingLineNumber = ($currentContents | Select-String -Pattern "^$currentDay $currentMonth`:").LineNumber
-
-if ($existingLineNumber) {
-   # Overwrite the existing line
-    $currentContents[$existingLineNumber - 1] = $newLine
+if ($existingLine) {
+    # Overwrite the existing line
+    $currentContents[$existingLine.LineNumber - 1] = $newLine
     Set-Content -Path $fullOutputPath -Value $currentContents
 }
 else {
